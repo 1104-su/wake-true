@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>真醒 WakeTrue — 最小 MVP</title>
+<style>
+  :root{
+    --bg:#0f1115; --fg:#e8eaed; --dim:#9aa0a6; --line:#2a2e36;
+    --accent:#5b8def; --warn:#f0b429; --danger:#e5484d;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+  body{
+    margin:0; min-height:100vh; background:var(--bg); color:var(--fg);
+    font:16px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+    display:flex; align-items:center; justify-content:center; padding:24px;
+  }
+  .card{width:100%; max-width:420px}
+  h1{font-size:20px; margin:0 0 4px}
+  .sub{color:var(--dim); font-size:13px; margin:0 0 28px}
+  .row{display:flex; gap:10px; align-items:center}
+  input[type=time]{
+    flex:1; padding:14px; font-size:22px; text-align:center;
+    background:#171a20; color:var(--fg); border:1px solid var(--line); border-radius:10px;
+    font-family:inherit;
+  }
+  button{
+    padding:14px 18px; font-size:16px; font-family:inherit; cursor:pointer;
+    border:1px solid var(--line); border-radius:10px; background:#171a20; color:var(--fg);
+  }
+  button.primary{background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600}
+  button:disabled{opacity:.35; cursor:not-allowed}
+  .big{font-size:44px; font-weight:700; letter-spacing:1px; margin:8px 0}
+  .meta{color:var(--dim); font-size:13px}
+  .meta b{color:var(--fg); font-weight:600}
+  .hr{height:1px; background:var(--line); margin:24px 0}
+  .dist{font-variant-numeric:tabular-nums}
+  .ok{color:#3ecf8e} .no{color:var(--warn)}
+  #ringScreen{
+    position:fixed; inset:0; z-index:10; display:none;
+    flex-direction:column; align-items:center; justify-content:center;
+    background:var(--danger); color:#fff; padding:24px; text-align:center;
+    animation:pulse 1s infinite alternate;
+  }
+  @keyframes pulse{from{background:#e5484d} to{background:#8c1c1f}}
+  #ringScreen.show{display:flex}
+  #ringScreen h2{font-size:28px; margin:0 0 20px}
+  #ringScreen .d{font-size:56px; font-weight:800; font-variant-numeric:tabular-nums; margin:12px 0}
+  #ringScreen button{
+    background:#fff; color:#8c1c1f; border:none; font-size:20px; font-weight:700;
+    padding:18px 40px; border-radius:12px; margin-top:12px;
+  }
+  #ringScreen button:disabled{background:rgba(255,255,255,.35); color:#fff; opacity:1}
+  .log{font-size:12px; color:var(--dim); font-variant-numeric:tabular-nums}
+  a.reset{color:var(--dim); font-size:12px; cursor:pointer; text-decoration:underline}
+</style>
+</head>
+<body>
+
+<div class="card" id="setupScreen">
+  <h1>真醒 WakeTrue</h1>
+  <p class="sub">最小 MVP：定 · 响 · 定位关</p>
+
+  <div class="row">
+    <input type="time" id="alarmTime" value="07:00">
+    <button class="primary" id="setBtn">定</button>
+  </div>
+
+  <p class="meta" id="originInfo" style="margin-top:18px">正在获取定位…</p>
+  <p><a class="reset" id="resetOrigin">重新记录原点</a></p>
+
+  <div class="hr"></div>
+  <div class="meta">关闭条件：离原点 &gt; <b id="radiusLabel">100</b> 米。没有别的关法。</div>
+</div>
+
+<div class="card" id="waitScreen" style="display:none">
+  <p class="sub" style="margin-bottom:8px">闹钟已定</p>
+  <div class="big" id="countdown">--:--:--</div>
+  <p class="meta" id="targetLabel"></p>
+
+  <div class="hr"></div>
+  <p class="meta">当前距原点 <b class="dist" id="distNow">--</b> 米</p>
+  <p class="meta">定位精度 ±<b class="dist" id="accNow">--</b></p>
+  <p class="meta" id="originInfo2"></p>
+  <p style="margin-top:18px"><a class="reset" id="cancelAlarm">取消这个闹钟</a></p>
+</div>
+
+<div id="ringScreen">
+  <h2>起床</h2>
+  <p style="margin:0; opacity:.85" id="ringRule"></p>
+  <div class="d dist" id="distRing">-- 米</div>
+  <p style="margin:0; opacity:.85">定位精度 ±<span class="dist" id="accRing">--</span></p>
+  <p id="ringHint" style="opacity:.9; margin:0"></p>
+  <button id="dismissBtn" disabled>关闭闹钟</button>
+</div>
+
+<script>
+/* ============ 可调参数（测试时把半径改小） ============ */
+const DISMISS_RADIUS_M = 50;   // 关闭条件：离原点必须超过这个距离
+const TICK_MS = 1000;
+
+const KEY = 'waketrue.mvp';
+const $ = id => document.getElementById(id);
+
+/* ============ 状态 ============ */
+let state = load();
+let origin = state.origin || null;
+let watching = null;
+
+function load(){
+  try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+  catch(e){ return {}; }
+}
+function save(){ localStorage.setItem(KEY, JSON.stringify(state)); }
+
+/* ============ 定位 ============ */
+function haversine(a, b){
+  const R = 6371000, toRad = d => d*Math.PI/180;
+  const dLat = toRad(b.lat-a.lat), dLng = toRad(b.lng-a.lng);
+  const s = Math.sin(dLat/2)**2 +
+            Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.sin(dLng/2)**2;
+  return 2*R*Math.asin(Math.sqrt(s));
+}
+
+function startWatch(){
+  if (!navigator.geolocation){ showGeoError('这个浏览器不支持定位'); return; }
+  if (watching !== null) navigator.geolocation.clearWatch(watching);
+  watching = navigator.geolocation.watchPosition(
+    pos => {
+      const here = {lat:pos.coords.latitude, lng:pos.coords.longitude};
+      state.here = here;
+      state.accuracy = pos.coords.accuracy;   // 米，68% 置信半径
+      state.fixAt = Date.now();               // 这次读数是什么时候拿到的
+      save();
+      if (!origin){ origin = here; state.origin = here; save(); }
+      renderDistance();
+    },
+    err => showGeoError(geoMsg(err)),
+    {enableHighAccuracy:true, maximumAge:5000, timeout:20000}
+  );
+}
+function geoMsg(err){
+  switch(err.code){
+    case 1: return '定位权限被拒绝 —— 没有定位就关不掉闹钟';
+    case 2: return '拿不到定位（室内常见）';
+    case 3: return '定位超时';
+    default: return '定位失败：' + err.message;
+  }
+}
+function showGeoError(msg){
+  origin = origin || null;
+  originInfo.textContent = msg;
+  originInfo.className = 'meta no';
+  if (ringing()) ringHint.textContent = msg;
+}
+
+function renderDistance(){
+  const d = (origin && state.here) ? haversine(origin, state.here) : null;
+  const acc = (typeof state.accuracy === 'number') ? state.accuracy : null;
+  const txt = d === null ? '--' : Math.round(d);
+  distNow.textContent = txt;
+
+  // 精度：<20m 看得过去；20-50m 勉强；>50m 这个判定基本没意义
+  const accTxt = acc === null ? '--' : Math.round(acc);
+  accNow.textContent = accTxt;
+  accRing.textContent = accTxt;
+  accNow.className = accRing.className =
+    'dist ' + (acc !== null && acc <= 20 ? 'ok' : 'no');
+
+  // 读数有多旧
+  const age = state.fixAt ? Math.round((Date.now() - state.fixAt)/1000) : null;
+  if (age !== null) {
+    originInfo2.textContent =
+      (origin ? `原点：${origin.lat.toFixed(5)}, ${origin.lng.toFixed(5)}　` : '') +
+      `· 定位更新于 ${age} 秒前`;
+  }
+
+  if (ringing()){
+    distRing.textContent = txt + ' 米';
+    const enough = d !== null && d > DISMISS_RADIUS_M;
+    dismissBtn.disabled = !enough;
+    ringHint.textContent = d === null
+      ? '拿不到定位，暂时关不掉'
+      : (enough ? '可以关了' : '还差 ' + Math.max(0, Math.ceil(DISMISS_RADIUS_M - d)) + ' 米');
+    ringHint.className = enough ? 'ok' : '';
+  }
+}
+
+/* ============ 响铃 ============ */
+let audioCtx = null, beepTimer = null;
+
+function startBeep(){
+  if (beepTimer) return;
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  let hi = false;
+  const once = () => {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = 'square';
+    o.frequency.value = (hi = !hi) ? 880 : 1180;
+    g.gain.value = 0.3;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + 0.45);
+  };
+  once();
+  beepTimer = setInterval(once, 700);
+}
+function stopBeep(){
+  if (beepTimer){ clearInterval(beepTimer); beepTimer = null; }
+}
+
+function ringing(){
+  return !!(state.alarmAt && Date.now() >= state.alarmAt && !state.ringingDismissed);
+}
+
+/* ============ 渲染循环 ============ */
+function tick(){
+  if (state.alarmAt && Date.now() >= state.alarmAt && !state.ringingDismissed){
+    enterRing();
+  } else if (state.alarmAt){
+    enterWait();
+  } else {
+    enterSetup();
+  }
+  renderDistance();
+}
+
+function enterSetup(){
+  ringScreen.classList.remove('show');
+  waitScreen.style.display = 'none';
+  setupScreen.style.display = '';
+  stopBeep();
+}
+
+function enterWait(){
+  ringScreen.classList.remove('show');
+  setupScreen.style.display = 'none';
+  waitScreen.style.display = '';
+  stopBeep();
+
+  const ms = state.alarmAt - Date.now();
+  const t = Math.max(0, Math.floor(ms/1000));
+  const hh = String(Math.floor(t/3600)).padStart(2,'0');
+  const mm = String(Math.floor(t%3600/60)).padStart(2,'0');
+  const ss = String(t%60).padStart(2,'0');
+  countdown.textContent = `${hh}:${mm}:${ss}`;
+  targetLabel.textContent = '响铃时间：' + new Date(state.alarmAt).toLocaleString('zh-CN');
+  originInfo2.textContent = origin
+    ? `原点：${origin.lat.toFixed(5)}, ${origin.lng.toFixed(5)}`
+    : '原点未记录';
+}
+
+function enterRing(){
+  if (ringScreen.classList.contains('show')) return;
+  setupScreen.style.display = 'none';
+  waitScreen.style.display = 'none';
+  ringScreen.classList.add('show');
+  startBeep();
+  renderDistance();
+}
+
+/* ============ 动作 ============ */
+setBtn.onclick = () => {
+  const [h, m] = alarmTime.value.split(':').map(Number);
+  const d = new Date();
+  d.setHours(h, m, 0, 0);
+  if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);   // 过了就定明天
+  state.alarmAt = d.getTime();
+  state.ringingDismissed = false;
+  save();
+  // 用这次点击解锁音频（浏览器自动播放策略）
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  audioCtx.resume();
+  tick();
+};
+
+dismissBtn.onclick = () => {
+  const now = Date.now();
+  state.log = state.log || [];
+  state.log.unshift({ringAt: state.alarmAt, dismissAt: now});
+  state.log = state.log.slice(0, 20);
+  state.ringingDismissed = true;
+  state.alarmAt = null;
+  save();
+  stopBeep();
+  tick();
+};
+
+cancelAlarm.onclick = () => {
+  state.alarmAt = null; state.ringingDismissed = false; save(); stopBeep(); tick();
+};
+
+resetOrigin.onclick = () => {
+  if (!state.here){ alert('还没拿到定位，稍等一下再试'); return; }
+  origin = state.here; state.origin = origin; save();
+  originInfo.textContent = '已重新记录原点：' + origin.lat.toFixed(5) + ', ' + origin.lng.toFixed(5);
+  originInfo.className = 'meta ok';
+  tick();
+};
+
+/* ============ 启动 ============ */
+radiusLabel.textContent = DISMISS_RADIUS_M;
+ringRule.textContent = `走到原点 ${DISMISS_RADIUS_M} 米以外才能关掉`;
+startWatch();
+tick();
+setInterval(tick, TICK_MS);
+</script>
+</body>
+</html>
